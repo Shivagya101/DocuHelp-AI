@@ -36,7 +36,7 @@ services:
     destination: /index.html
 
 # 3. Scraper Worker (Background Task)
-- type: worker
+- type: web
   name: docuhelp-scraper
   env: docker
   rootDir: rag
@@ -49,7 +49,7 @@ services:
     sync: false
 
 # 4. Parser Worker (Background Task)
-- type: worker
+- type: web
   name: docuhelp-parser
   env: docker
   rootDir: rag
