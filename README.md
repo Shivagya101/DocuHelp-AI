@@ -138,11 +138,7 @@ python -m workers.cron_worker
 ## 👥 Team
 
 Built by the DocuHelp Team — **NIT Jamshedpur**
-- **Prince** 
-- **Harsha** 
-- **Shivagya** 
-- **Satyam** 
-- **Ashutosh** 
+- **Shivagya**  
 
 ## 📄 License
 
