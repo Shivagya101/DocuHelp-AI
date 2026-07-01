@@ -1,8 +1,8 @@
-# 🛡️ PrivaShield AI
+# 🛡️ DocuHelp (Documentation Engine)
 
-### An Interactive Legal-to-Permission Mapping Engine
+### An Intelligent Software Documentation & API Reference Assistant
 
-PrivaShield AI is an intelligent middleware that bridges the gap between dense legal privacy policies and actual device-level permissions — transforming **blind consent** into **contextual consent**.
+DocuHelp is an intelligent middleware designed to ingest, monitor, deduplicate, and semantically query massive volumes of **software documentation**, **API references**, and **developer guides**. It tracks documentation changes over time using structural diffing and allows developers to chat with their ecosystem documentation via an advanced RAG (Retrieval-Augmented Generation) pipeline.
 
 ---
 
@@ -10,31 +10,33 @@ PrivaShield AI is an intelligent middleware that bridges the gap between dense l
 
 | Feature | Description |
 |---------|-------------|
-| **AI Policy Summarizer** | Instantly summarize 10,000+ word privacy policies into actionable insights |
-| **Risk Score Engine** | Get a 1-10 risk rating with detailed breakdowns |
-| **Permission Mapper** | Map policy text to device permissions (camera, location, etc.) with deny-consequence explanations |
-| **Hidden Clause Detector** | AI finds buried clauses about data selling, perpetual ownership, arbitration traps |
-| **RAG Chatbot** | Ask questions about any policy in natural language |
-| **Chrome Extension** | One-click analysis on any website |
+| **Smart Ingestion Pipeline** | Uses Playwright (Headless Browser) running in background RQ workers to dynamically crawl modern documentation sites (React, Vue, SPAs). |
+| **Two-Stage Deduplication** | Employs exact text-matching (`pg_trgm`) and semantic vector thresholding (`pgvector` distance < 0.10) to aggressively block duplicate context from polluting the vector space. |
+| **Merkle Tree Structural Diffing** | Compares the hierarchical heading structure (H1-H6) of incoming document updates against the existing database, calculating precise patch sets to insert, update, or delete chunks. |
+| **Hybrid Search (In Progress)** | Combines exact keyword matching (BM25) with semantic vector search, dynamically re-ranking results using Reciprocal Rank Fusion (RRF). |
+| **RAG Chatbot** | Ask questions about any ingested documentation in natural language powered by Groq and Cohere embeddings. |
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-Frontend (Chrome Extension / React Dashboard)
-        ↓
-  Node.js API Gateway (Express)
+User (Dashboard / API)
         ↓
   Python RAG Engine (FastAPI)
-        ↓
-  ┌─────────────────────────────────────┐
-  │  Text Cleaning + Section Chunking   │
-  │  Embeddings (MiniLM-L6-v2)         │
-  │  Vector DB (FAISS)                  │
-  │  AI Analysis (Groq)    │
-  │  Risk Analyzer + Permission Mapper  │
-  └─────────────────────────────────────┘
+        │
+        ├─▶ Cronjob Dispatcher (Detects stale documentation)
+        │       ↓ (Redis Queue)
+        ├─▶ Scraper Worker (Playwright / BeautifulSoup)
+        │       ↓ (RabbitMQ Queue)
+        └─▶ Parser Worker (Merkle Tree Diffing / Chunking)
+                ↓
+  ┌──────────────────────────────────────────────┐
+  │  PostgreSQL (pgvector, pg_trgm)              │
+  │  Two-Stage Deduplication Gate                │
+  │  Cohere Embeddings                           │
+  │  Groq (LLM Inference)                        │
+  └──────────────────────────────────────────────┘
 ```
 
 ---
@@ -42,121 +44,80 @@ Frontend (Chrome Extension / React Dashboard)
 ## 📂 Project Structure
 
 ```
-PrivaShield-AI/
-├── extension/              # Chrome Extension (Manifest V3)
-│   ├── manifest.json       # Extension configuration
-│   ├── popup.html/css/js   # Extension popup UI
-│   ├── content.js          # Page HTML extractor
-│   ├── background.js       # Service worker
-│   └── icons/              # Extension icons
+DocuHelp/
+├── frontend/               # React Dashboard (TBD)
+├── backend/                # Node.js API Gateway (Legacy)
+├── extension/              # Chrome Extension (Legacy)
 │
-├── backend/                # Node.js API Gateway
-│   └── src/server.js       # Express proxy to Python service
-│
-├── frontend/               # React + Vite Dashboard
-│   └── src/
-│       ├── components/
-│       │   ├── PrivaShield.jsx   # Main app shell
-│       │   ├── LandingPage.jsx   # Hero + features + architecture
-│       │   ├── Dashboard.jsx     # URL analysis dashboard
-│       │   └── Chatbot.jsx       # RAG chatbot interface
-│       └── privashield.css       # Design system
-│
-├── rag/                    # Python RAG Engine
-│   ├── main.py             # FastAPI app (original endpoints)
-│   ├── run.py              # Enhanced entry point (all endpoints)
-│   ├── ai_engine.py        # Text cleaning, FAISS, Gemini summarizer
-│   ├── risk_analyzer.py    # Risk analysis, permission mapping, hidden clauses
-│   ├── enhanced_routes.py  # New API routes (risks, permissions, hidden-clauses)
-│   ├── database.py         # MySQL/SQLAlchemy models
-│   └── requirements.txt    # Python dependencies
+├── rag/                    # Python RAG & Ingestion Engine
+│   ├── main.py             # FastAPI backend interface
+│   ├── database.py         # SQLAlchemy Setup (PostgreSQL)
+│   ├── ai_engine.py        # Embeddings (Cohere), Chunking (LangChain), LLM (Groq)
+│   ├── merkle_sync.py      # Merkle Tree structural diffing logic
+│   ├── run_workers.ps1     # Unified launcher for background workers
+│   │
+│   ├── repository/         # Database persistence layers
+│   │   └── scan_repository.py  # `pg_trgm` and `pgvector` Two-Stage logic
+│   │
+│   └── workers/            # Background Processors
+│       ├── cron_worker.py      # Dispatches stale documentation updates
+│       ├── start_worker.py     # RQ Worker (Playwright Scraper)
+│       └── parser_worker.py    # RabbitMQ Consumer (Merkle Diff Engine)
 │
 └── README.md
 ```
 
 ---
 
-## 🚀 Quick Start (Unified Launcher)
+## 🛠️ Setup & Execution
 
-If you are on **Windows**, we have provided a unified PowerShell script to launch all three services (**AI Engine**, **Backend Gateway**, and **Frontend**) simultaneously in separate windows:
+### 1. Database & Brokers (Docker)
+Ensure you have the core infrastructure running via Docker:
+- **PostgreSQL** (with `pgvector` and `pg_trgm` enabled) on port `5432`
+- **Redis** on port `6379` (For RQ Task Queue)
+- **RabbitMQ** on port `5672` (For Parser Queue)
 
-1. Open a **PowerShell** terminal in the root directory.
-2. Run the unified launcher:
-   ```powershell
-   .\run_all.ps1
-   ```
-3. Three new windows will open. Once they are initialized, you can access the dashboard at:
-   👉 **[http://localhost:5173](http://localhost:5173)**
+### 2. Environment Variables
+Create a `.env` file in the `rag/` directory:
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/docuhelp
+REDIS_URL=redis://localhost:6379/0
+RABBITMQ_URL=amqp://guest:guest@localhost:5672/
+COHERE_API_KEY=your_key
+GROQ_API_KEY=your_key
+```
 
----
+### 3. Running the RAG Engine & Workers
+Activate your virtual environment, then start the background pipeline:
 
-## 🛠️ Manual Setup
-
-If you prefer to start components individually, follow these steps:
-
-### 1. RAG Engine (Python)
-The engine uses **SQLite** by default (zero-config).
 ```bash
 cd rag
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-# Add your GOOGLE_API_KEY to .env
-python run.py
-```
+playwright install
 
-### 2. Node.js Gateway
-```bash
-cd backend
-npm install
-npm start
-```
+# Terminal 1: Start the Scraper Worker (RQ)
+python -m workers.start_worker
 
-### 3. React Frontend
-```bash
-cd frontend
-npm install
-npm run dev
-```
+# Terminal 2: Start the Parser Worker (RabbitMQ)
+python -u -m workers.parser_worker
 
-### 4. Chrome Extension
-1. Open Chrome → `chrome://extensions/`
-2. Enable **Developer mode**.
-3. Click **Load unpacked** and select the `extension/` folder.
-
----
-
-## 🔌 API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/` | Health check |
-| `POST` | `/analyze` | Analyze policy HTML → summary + vector DB |
-| `POST` | `/chat` | Chat with analyzed policy (RAG) |
-| `POST` | `/risks` | Risk analysis with score & red flags |
-| `POST` | `/permissions` | Device permission mapping |
-| `POST` | `/hidden-clauses` | Hidden/dangerous clause detection |
-| `POST` | `/full-analysis` | Complete analysis (all above combined) |
-
-### Example Request
-
-```bash
-curl -X POST http://localhost:8000/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "html": "<html><body>We collect your personal data including location, contacts, and browsing history. This data may be shared with third-party advertisers...</body></html>"}'
+# Terminal 3: Fire the Cron Dispatcher (or run it on a schedule)
+python -m workers.cron_worker
 ```
 
 ---
 
-## 🧠 How It Works
+## 🧠 Deep Dive: Ingestion Engine
 
-1. **Policy Extraction** — Chrome extension extracts page HTML via content script
-2. **Text Cleaning** — BeautifulSoup strips scripts, styles, nav elements → clean text
-3. **Chunking** — RecursiveCharacterTextSplitter creates overlapping chunks (2000 tokens, 200 overlap)
-4. **Embeddings** — `sentence-transformers/all-MiniLM-L6-v2` generates vector embeddings
-5. **Vector Storage** — FAISS indexes chunks for semantic search
-6. **AI Analysis** — Groq analyzes for risks, permissions, hidden clauses
-7. **RAG Chat** — User questions → FAISS similarity search → Groq generates contextual answers
+1. **Detection** — The `cron_worker` scans the PostgreSQL `processed_sites` table for URLs that haven't been updated in X days. It pushes a task to Redis.
+2. **Dynamic Scraping** — The `start_worker` uses Playwright to fully render JavaScript-heavy documentation pages, extracts the HTML, and pushes a payload to RabbitMQ.
+3. **Chunking** — The `parser_worker` consumes the HTML. It cleans the text and uses a `MarkdownHeaderTextSplitter` combined with a `RecursiveCharacterTextSplitter` to create structural, overlapping chunks.
+4. **Merkle Diffing** — A hierarchical Merkle Tree is built from the new chunks and compared against the existing tree in the database, yielding precise `to_add` and `to_delete` batches.
+5. **Two-Stage Deduplication** — Before new chunks are blindly inserted, they pass through a strict Postgres gate:
+    - **Stage 1 (Text):** `pg_trgm` drops any chunk that shares 90% literal text similarity with an existing chunk.
+    - **Stage 2 (Vector):** Cohere embeds the surviving chunks. `pgvector` drops any chunk with a cosine distance `< 0.10` compared to existing chunks.
 
 ---
 
@@ -164,28 +125,24 @@ curl -X POST http://localhost:8000/analyze \
 
 | Layer | Technology |
 |-------|-----------|
-| Chrome Extension | Manifest V3, Vanilla JS |
-| Frontend | React 19, Vite 7 |
-| API Gateway | Node.js, Express |
-| RAG Engine | Python, FastAPI |
-| AI/LLM | Groq |
-| Embeddings | sentence-transformers (MiniLM-L6-v2) |
-| Vector DB | FAISS |
-| Database | MySQL + SQLAlchemy |
-| Text Processing | BeautifulSoup, LangChain |
+| **Core RAG Engine** | Python, FastAPI |
+| **Background Tasks** | Redis Queue (RQ), RabbitMQ |
+| **Dynamic Scraper** | Playwright, BeautifulSoup |
+| **Vector DB** | PostgreSQL (`pgvector`, `pg_trgm`) |
+| **Embeddings** | Cohere |
+| **AI / LLM** | Groq |
+| **Text Processing** | LangChain |
 
 ---
 
 ## 👥 Team
 
-Built by the PrivaShield AI Team — **NIT Jamshedpur**
-
-- **Prince** — Chief Privacy Architect
-- **Harsha** — Policy Miner & API Specialist
-- **Shivagya** — RAG Engine Strategist
-- **Satyam** — Threat Intelligence Analyst
-- **Ashutosh** — Extension & UX Engineer
-
+Built by the DocuHelp Team — **NIT Jamshedpur**
+- **Prince** 
+- **Harsha** 
+- **Shivagya** 
+- **Satyam** 
+- **Ashutosh** 
 
 ## 📄 License
 

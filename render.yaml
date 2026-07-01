@@ -1,18 +1,31 @@
 services:
+# 1. FastAPI Backend (Uses Dockerfile in /rag)
 - type: web
-  name: privashield-backend
-  buildCommand: npm install
-  startCommand: npm start
-  rootDir: backend
-  envVars:
-  - key: PORT
-    value: '5000'
-  runtime: node
+  name: docuhelp-api
+  env: docker
+  rootDir: rag
   plan: free
+  envVars:
+  - key: DATABASE_URL
+    fromDatabase:
+      name: docuhelp-db
+      property: connectionString
+  - key: REDIS_URL
+    sync: false
+  - key: RABBITMQ_URL
+    sync: false
+  - key: COHERE_API_KEY
+    sync: false
+  - key: GROQ_API_KEY
+    sync: false
+
+# 2. React Frontend (Static Site)
 - type: web
-  name: privashield-frontend
+  name: docuhelp-frontend
+  env: static
   buildCommand: npm install && npm run build
   rootDir: frontend
+  staticPublishPath: dist
   headers:
   - path: /*
     name: Access-Control-Allow-Origin
@@ -21,10 +34,41 @@ services:
   - type: rewrite
     source: /*
     destination: /index.html
-  runtime: static
-  staticPublishPath: dist
+
+# 3. Scraper Worker (Background Task)
+- type: worker
+  name: docuhelp-scraper
+  env: docker
+  rootDir: rag
+  dockerCommand: python -m workers.start_worker
+  plan: free
+  envVars:
+  - key: REDIS_URL
+    sync: false
+  - key: RABBITMQ_URL
+    sync: false
+
+# 4. Parser Worker (Background Task)
+- type: worker
+  name: docuhelp-parser
+  env: docker
+  rootDir: rag
+  dockerCommand: python -u -m workers.parser_worker
+  plan: free
+  envVars:
+  - key: DATABASE_URL
+    fromDatabase:
+      name: docuhelp-db
+      property: connectionString
+  - key: REDIS_URL
+    sync: false
+  - key: RABBITMQ_URL
+    sync: false
+  - key: COHERE_API_KEY
+    sync: false
+
 databases:
-- name: privashield-db
-  databaseName: privashield
+- name: docuhelp-db
+  databaseName: docuhelp
   user: admin
   plan: free

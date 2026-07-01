@@ -1,6 +1,56 @@
-
-
 services:
+  # ─────────────────────────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:0.8.2-pg15
+    container_name: privashield_postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: privashield
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d privashield"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.8-alpine
+    container_name: privashield_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: privashield_rabbitmq
+    ports:
+      - "5672:5672"   # AMQP protocol port
+      - "15672:15672" # Management UI port
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # RAG ENGINE & WORKERS
+  # ─────────────────────────────────────────────────────────────────
   rag:
     build:
       context: ./rag
@@ -8,33 +58,98 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - rag_data:/app/storage
+      - ./rag:/app
     env_file:
       - ./rag/.env
-    restart: unless-stopped
-
-  backend:
-    build:
-      context: ./backend
-    container_name: privashield_backend
-    ports:
-      - "5000:5000"
     environment:
-      - RAG_API_URL=http://rag:8000
-      - PORT=5000
+      - DATABASE_URL=postgresql://user:password@postgres:5432/privashield
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
     depends_on:
-      - rag
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     restart: unless-stopped
 
+  scraper-worker:
+    build:
+      context: ./rag
+    container_name: privashield_scraper_worker
+    command: rq worker scrape_tasks --url redis://redis:6379/0
+    volumes:
+      - ./rag:/app
+    env_file:
+      - ./rag/.env
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/privashield
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  parser-worker:
+    build:
+      context: ./rag
+    container_name: privashield_parser_worker
+    command: python -m workers.parser_worker
+    volumes:
+      - ./rag:/app
+    env_file:
+      - ./rag/.env
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/privashield
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cron-worker:
+    build:
+      context: ./rag
+    container_name: privashield_cron_worker
+    command: python -m workers.cron_worker
+    volumes:
+      - ./rag:/app
+    env_file:
+      - ./rag/.env
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/privashield
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # FRONTEND UI
+  # ─────────────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
     container_name: privashield_frontend
     ports:
-      - "5173:80"
+      - "5173:80"  # Expose internal Nginx port 80 to 5173 on localhost
     depends_on:
-      - backend
+      - rag
     restart: unless-stopped
 
 volumes:
-  rag_data:
+  postgres_data:

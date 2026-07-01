@@ -1,27 +1,26 @@
 ---
-title: PrivaShield RAG
+title: DocuHelp RAG
 emoji: 🛡️
 colorFrom: blue
 colorTo: purple
 sdk: docker
 pinned: false
-app_port: 7860
+app_port: 8000
 ---
 
-# PrivaShield AI — RAG Engine
+# DocuHelp — RAG Engine
 
-FastAPI-based privacy policy analysis service powering the PrivaShield AI platform.
+FastAPI-based documentation analysis service powering the DocuHelp platform.
 
 ## Endpoints
 - `GET /` — Health check
-- `POST /fetch-html` — Fetch page HTML (server-side to avoid CORS)
-- `POST /full-analysis` — Complete parallel AI analysis
-- `POST /analyze` — Policy summary
-- `POST /chat` — Chat with analyzed policy
-- `POST /risks` — Risk analysis
-- `POST /permissions` — Permission mapping
-- `POST /hidden-clauses` — Hidden clause detection
+- `POST /analyze` — Submits a documentation URL for processing, or returns cached status and internal links.
+- `POST /sync_bulk` — Accepts an array of internal links and queues them for scraping.
+- `POST /chat` — SSE streaming endpoint to chat with the ingested documentation.
 
-## Environment Variables (set as Space Secrets)
-- `GROQ_API_KEY` — Your Groq API key
-- `DATABASE_URL` — PostgreSQL connection string (optional, falls back to SQLite)
+## Environment Variables
+- `GROQ_API_KEY` — Your Groq API key for LLM inference
+- `COHERE_API_KEY` — Your Cohere API key for vector embeddings and reranking
+- `DATABASE_URL` — PostgreSQL connection string (must have pgvector and pg_trgm extensions)
+- `REDIS_URL` — Redis connection string for background task queues
+- `RABBITMQ_URL` — RabbitMQ connection string for chunking/parsing queues

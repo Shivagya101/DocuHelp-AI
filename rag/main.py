@@ -1,138 +1,224 @@
-import os
-import hashlib
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse
+import json
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
-import httpx
-# Import our custom modules
+from sqlalchemy.ext.asyncio import AsyncSession
+
 import database
-from database import get_db, ProcessedSite
+from database import get_async_db
+from repository import scan_repository
+from utils.redis_provider import enqueue_scrape_task
 import ai_engine
+from utils.rate_limiter import RateLimiter
 
-app = FastAPI(title="PrivacyLens API", version="1.0")
+from fastapi import FastAPI, HTTPException, Depends
+from contextlib import asynccontextmanager
 
-# --- 1. CORS CONFIGURATION (Crucial for Chrome Extensions) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Run on startup
+    await database.init_db()
+    yield
+    # Run on shutdown
+    pass
+
+app = FastAPI(title="DocuHelper", version="1.0", lifespan=lifespan)
+
+# --- 1. CORS CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all extensions/sites to access. Secure enough for MVP.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 2. DATA MODELS (Pydantic) ---
-
+# --- 2. DATA MODELS ---
 class AnalyzeRequest(BaseModel):
     url: str
-    html: str
+
+class AnalyzeResponse(BaseModel):
+    status: str
+    message: str
+    internal_links: list[str] = []
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
 
 class ChatRequest(BaseModel):
     url: str
     question: str
-
-class AnalyzeResponse(BaseModel):
-    status: str
-    summary: str
+    history: list[ChatMessage] = []
 
 class ChatResponse(BaseModel):
     answer: str
+    citations: list[str] = []
 
-class URLRequest(BaseModel):
-    url: str
 
-# --- 3. ENDPOINTS ---
+# --- 4. ENDPOINTS ---
 
 @app.get("/")
 async def home():
-    return {"message": "PrivacyLens API is running."}
+    return {"message": "DocuHelper is running."}
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_policy(request: AnalyzeRequest, db: Session = Depends(get_db)):
+async def analyze_policy(request: AnalyzeRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("analyze", max_requests=100, window_seconds=86400))):
     """
-    Receives HTML.
     1. Checks if we already have a scan for this URL in Database.
-    2. If YES: Returns the cached summary.
-    3. If NO: Runs AI, saves clean text to DB.
+    2. If YES: the user can chat, and we return the discovered internal_links for manual sync.
+    3. If NO: Drops a ticket into Redis and tells the user to refresh later.
     """
-    # Check Cache (DB)
-    existing_scan = database.get_scan_by_url(db, request.url)
-    
-    # If scan exists and we have the clean policy text
+    # Normalize URL by removing trailing slashes
+    target_url = request.url.rstrip("/")
+
+    # 1. Check if it's already in Postgres
+    existing_scan = await scan_repository.get_scan_by_url_async(db, target_url)
     if existing_scan and existing_scan.policy_text:
         return AnalyzeResponse(
             status="cached",
-            summary=existing_scan.risk_summary
+            message="Already processed!",
+            internal_links=existing_scan.internal_links or []
+        )
+        
+    # 2. Use Redis Atomic Lock to prevent duplicate scraping
+    from utils.redis_provider import get_async_redis_connection
+    redis_conn = get_async_redis_connection()
+    active_key = f"active:{target_url}"
+    
+    # Try to set an active lock. Returns True if successful, False if already exists.
+    is_fresh_request = await redis_conn.set(active_key, "1", nx=True, ex=1800)
+    
+    if not is_fresh_request:
+        return AnalyzeResponse(
+            status="processing",
+            message="Already in queue! Please wait."
         )
 
-    # PROCESS NEW SCAN
-    # 1. Create unique hash for filenames
-    url_hash = hashlib.md5(request.url.encode()).hexdigest()
-    saved_summary = existing_scan.risk_summary if existing_scan else None
-    # 2. Run AI Engine (Clean -> Summarize)
-    try:
-         summary, _, policy_text = ai_engine.process_policy(request.html, url_hash, existing_summary=saved_summary)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Processing Failed: {str(e)}")
-
-    if not policy_text:
-        raise HTTPException(status_code=400, detail="Could not extract text from HTML.")
-
-    # 3. Save Metadata to DB
-    if existing_scan:
-        existing_scan.risk_summary = summary
-        existing_scan.policy_text = policy_text
-        db.commit()
-    else:
-        database.create_scan(db, request.url, summary, "", policy_text)
+    # 2. PROCESS NEW SCAN (Async via Redis)
+    print(f"Enqueueing scrape task for {target_url}")
+    # We no longer pass max_depth > 0, as we only scrape the single requested page.
+    enqueue_scrape_task(target_url, base_url=target_url, current_depth=0, max_depth=0)
+    
+    await redis_conn.close()
 
     return AnalyzeResponse(
-        status="processed_new",
-        summary=summary
+        status="processing",
+        message="Your link has been queued for scraping. Please check back soon."
     )
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_policy(request: ChatRequest, db: Session = Depends(get_db)):
+from pydantic import BaseModel, Field
+
+class SyncBulkRequest(BaseModel):
+    urls: list[str] = Field(..., max_length=5, description="Maximum of 5 URLs per bulk sync request")
+
+@app.post("/sync_bulk")
+async def sync_bulk_urls(request: SyncBulkRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("analyze", max_requests=100, window_seconds=86400))):
+    """
+    Endpoint for Manual User-Driven Sync. 
+    Accepts a list of URLs and drops them into the queue.
+    Uses the same 'analyze' rate limit to prevent abuse.
+    """
+    from utils.redis_provider import get_async_redis_connection
+    redis_conn = get_async_redis_connection()
+    
+    queued_count = 0
+    for url in request.urls:
+        target_url = url.rstrip("/")
+        active_key = f"active:{target_url}"
+        
+        # Check cache
+        existing_scan = await scan_repository.get_scan_by_url_async(db, target_url)
+        if existing_scan and existing_scan.policy_text:
+            continue
+            
+        # Check active lock
+        if await redis_conn.set(active_key, "1", nx=True, ex=1800):
+            enqueue_scrape_task(target_url, base_url=target_url, current_depth=0, max_depth=0)
+            queued_count += 1
+            
+    await redis_conn.close()
+    return {"status": "success", "message": f"Successfully queued {queued_count} new pages for sync."}
+
+@app.post("/chat")
+async def chat_policy(request: ChatRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("chat", max_requests=100, window_seconds=86400))):
     """
     User asks a question about a specific URL.
-    We load the persistent policy text from Database and answer directly using Groq's context window.
+    We load the context from Database and answer directly using Groq's context window.
+    Server-Sent Events (SSE) to stream the response.
     """
-    # 1. Find the scan record
-    scan = database.get_scan_by_url(db, request.url)
+    # Normalize URL by removing trailing slashes
+    target_url = request.url.rstrip("/")
+
+    scan = await scan_repository.get_scan_by_url_async(db, target_url)
     
     if not scan or not scan.policy_text:
         raise HTTPException(status_code=404, detail="Policy not found. Please analyze the site first.")
 
-    # 2. Generate Answer
-    answer = ai_engine.chat_with_policy(request.question, scan.policy_text)
+    if scan.policy_text.startswith('{"status": "rejected"'):
+        try:
+            error_data = json.loads(scan.policy_text)
+            similar = ", ".join(error_data.get("similar_sites", []))
+            raise HTTPException(status_code=400, detail=f"Site Rejected: {error_data.get('reason')}. Matches found with: {similar}")
+        except json.JSONDecodeError:
+            pass
+
+    # Convert Pydantic history models to dicts for ai_engine
+    history_dicts = [{"role": msg.role, "content": msg.content} for msg in request.history]
+
+    # 1. Expand the user's question with synonyms using the LLM (condensing history if present)
+    expanded_query = await ai_engine.expand_query_async(request.question, history=history_dicts)
+
+    # 2. Embed the EXPANDED question to fetch relevant chunks
+    query_embedding = ai_engine.embedding_model.embed_query(expanded_query)
     
-    return ChatResponse(answer=answer)
+    # 3. Query pgvector for a massive net of 30 chunks across the entire crawled domain
+    relevant_chunks = await scan_repository.get_relevant_chunks_async(db, request.url, query_embedding, limit=30)
+        
+    if not relevant_chunks:
+        raise HTTPException(status_code=500, detail="Error: No indexed chunks found for this policy. Please re-analyze the site.")
+        
+    # 4. Use Cohere Cross-Encoder to mathematically Re-Rank the 30 chunks down to the top 5
+    raw_chunks = [{"text": chunk.parent_text or chunk.chunk_text, "url": chunk.site.url} for chunk in relevant_chunks]
+    top_5_chunks = await ai_engine.rerank_chunks(expanded_query, raw_chunks, top_n=5)
 
-@app.post("/fetch-html")
-async def fetch_html(request: URLRequest):
-    try:
-        # We use an async client to keep FastAPI fast
-        async with httpx.AsyncClient() as client:
-            # Adding a standard User-Agent prevents many websites from blocking the request
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    # 5. Combine the top 5 chunks into our RAG context and extract unique citations
+    citations = []
+    formatted_context_chunks = []
+    seen_texts = set()
+    
+    for c in top_5_chunks:
+        text = c["text"]
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+        
+        url = c["url"]
+        if url not in citations:
+            citations.append(url)
+        
+        # Determine the 1-indexed citation number
+        citation_num = citations.index(url) + 1
+        formatted_context_chunks.append(f"Source [{citation_num}] ({url}):\n{text}")
+
+    context = "\n\n---\n\n".join(formatted_context_chunks)
+
+    # 6. Generator for SSE
+    async def event_generator():
+        # First, send the citations
+        yield f"data: {json.dumps({'type': 'citations', 'citations': citations})}\n\n"
+        
+        # Then, stream the LLM chunks
+        async for chunk_text in ai_engine.chat_with_policy_async(request.question, context, history=history_dicts):
+            yield f"data: {json.dumps({'type': 'chunk', 'text': chunk_text})}\n\n"
             
-            # Fetch the URL
-            response = await client.get(request.url, headers=headers, follow_redirects=True)
-            response.raise_for_status() # Throw an error if we get a 404, 500, etc.
-            
-            return {"html": response.text}
-            
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=f"Target URL returned an error: {e.response.status_code}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {str(e)}")
+        # Finally, signify end of stream
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-
-# --- 4. STARTUP ---
 if __name__ == "__main__":
+ 
     import uvicorn
-    # Create Tables on startup if they don't exist
-    database.init_db()
-    uvicorn.run(app, host="0.0.0.0", port=8000,reload=True,
-                reload_excludes=["storage/*", "*.log", "test.py"])
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)

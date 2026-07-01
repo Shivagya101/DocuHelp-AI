@@ -1,79 +1,89 @@
 import os
-import hashlib
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from sqlalchemy.sql import func
+import sys
+import asyncio
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, JSON
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.sql import func, text
+from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # --- 1. CONFIGURATION ---
-# Use DATABASE_URL from environment (e.g. Render MySQL), otherwise fallback to local SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    STORAGE_DIR = "storage"
-    os.makedirs(STORAGE_DIR, exist_ok=True)
-    DATABASE_PATH = os.path.join(STORAGE_DIR, "privashield.db")
-    DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
-    print(f"Using local SQLite database at {DATABASE_PATH}")
-else:
-    # Ensure DATABASE_URL is compatible with SQLAlchemy 2.0 (replace postgres:// with postgresql:// if needed)
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    print("Using external database from DATABASE_URL")
+    raise ValueError("DATABASE_URL environment variable is required for production architecture.")
 
-# Connect arguments only needed for SQLite
-connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_recycle=3600, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+print("Using PostgreSQL database from DATABASE_URL")
+
+# Async Configuration - The Gold Standard!
+import re
+ASYNC_DATABASE_URL = re.sub(r"^postgres(ql)?(\+[a-zA-Z0-9_-]+)?://", "postgresql+asyncpg://", DATABASE_URL)
+
+# 1. API Pool (High Performance, used by FastAPI)
+async_engine = create_async_engine(ASYNC_DATABASE_URL, pool_recycle=3600)
+AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=async_engine, class_=AsyncSession)
+
 Base = declarative_base()
 
-# --- 2. THE MODEL ---
+# --- 2. THE MODELS ---
 class ProcessedSite(Base):
     __tablename__ = "processed_sites"
 
     id = Column(Integer, primary_key=True, index=True)
-    url_hash = Column(String(64), unique=True, index=True)
+    url_hash = Column(String(32), unique=True, index=True, nullable=False)
     url = Column(Text, nullable=False)
-    risk_summary = Column(Text, nullable=True) # Matches database_lite schema
-    vector_index_path = Column(String(255), nullable=True)
-    policy_text = Column(Text, nullable=True)
+    policy_text = Column(Text, nullable=True) # Will store raw markdown
+    internal_links = Column(JSON, nullable=True, default=list) # Stores discovered child URLs
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    chunks = relationship("PolicyChunk", back_populates="site", cascade="all, delete")
 
-# --- 3. DATABASE LOGIC ---
-def create_scan(db: Session, url: str, summary: str, index_path: str, policy_text: str = None):
-    url_hash = hashlib.md5(url.encode()).hexdigest()
-    db_scan = ProcessedSite(
-        url_hash=url_hash,
-        url=url,
-        risk_summary=summary,
-        vector_index_path=index_path,
-        policy_text=policy_text
-    )
-    db.add(db_scan)
-    db.commit()
-    db.refresh(db_scan)
-    return db_scan
+class PolicyChunk(Base):
+    __tablename__ = "policy_chunks"
 
-def get_scan_by_url(db: Session, url: str):
-    url_hash = hashlib.md5(url.encode()).hexdigest()
-    return db.query(ProcessedSite).filter(ProcessedSite.url_hash == url_hash).first()
+    id = Column(Integer, primary_key=True, index=True)
+    site_id = Column(Integer, ForeignKey("processed_sites.id", ondelete="CASCADE"), index=True)
+    chunk_text = Column(Text, nullable=False)
+    parent_text = Column(Text, nullable=False) # Important for full context!
+    # Using 1024 for Cohere embed-english-v3.0
+    embedding = Column(Vector(1024))
+    
+    site = relationship("ProcessedSite", back_populates="chunks")
 
-def get_db():
-    db = SessionLocal()
-    try:
+# --- 3. DATABASE SETUP ---
+async def get_async_db():
+    async with AsyncSessionLocal() as db:
         yield db
-    finally:
-        db.close()
 
 # --- 4. INITIALIZATION ---
-def init_db():
-    print("Initializing database tables...")
-    Base.metadata.create_all(bind=engine)
+async def init_db():
+    print("Initializing database tables with pgvector and pg_trgm extensions (Async)...")
+    async with async_engine.begin() as conn:
+        # 1. WHAT IS VECTOR? 
+        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
+        
+        # 2. WHAT IS PG_TRGM?
+        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS pg_trgm'))
+        
+        # 3. WHERE ARE THE TABLES CREATED?
+        # run_sync bridges the gap between async execution and SQLAlchemy's sync metadata builder
+        await conn.run_sync(Base.metadata.create_all)
+        
+        # 4. WHAT IS GIN?
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS trgm_idx ON policy_chunks USING gin (parent_text gin_trgm_ops)'))
+        
+        # 5. WHAT IS HNSW? (Hierarchical Navigable Small World)
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS chunk_embedding_idx ON policy_chunks USING hnsw (embedding vector_cosine_ops)'))
+        
     print("Database ready.")
 
 if __name__ == "__main__":
-    init_db()
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(init_db())
