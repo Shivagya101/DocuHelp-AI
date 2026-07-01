@@ -3,7 +3,7 @@ fastapi
 uvicorn
 python-multipart
 
-# HTTP client (for fetch-html endpoint)
+# HTTP client
 httpx
 
 # HTML parsing
@@ -17,6 +17,7 @@ langchain-core>=0.3.0
 langchain-openai>=0.2.0
 langchain-groq>=0.2.0
 langchain-cohere>=0.3.0
+langchain-text-splitters
 cohere
 openai
 groq
@@ -25,33 +26,22 @@ groq
 pydantic
 pydantic-settings
 
-# Database
+# Database (Async PostgreSQL + Vector)
 SQLAlchemy
-psycopg[binary]
+asyncpg
+pgvector
 
 # Utilities
 python-dotenv
 requests
 tenacity
 anyio
+markdownify
 
 # Queues and Workers
 redis
 rq
-pika
+aio-pika
 
 # Advanced Scraping
 playwright
-
-# Vector DB
-pgvector
-
-pytest
-pytest-asyncio
-pytest-mock
-
-langchain-text-splitters
-markdownify
-aio-pika
-
-
