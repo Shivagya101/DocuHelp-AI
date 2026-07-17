@@ -1,25 +1,27 @@
-# DocuHelp AI — Intelligent Documentation Assistant
+# DocuHelp AI
 
-> A production-grade, distributed RAG (Retrieval-Augmented Generation) engine that ingests any software documentation website and lets developers ask natural-language questions with citation-backed, streaming answers.
+> A distributed RAG engine for querying software documentation.
 
 ---
 
-## Features
+## Core Features (Interview Highlights)
 
 | Feature | Description |
 |---|---|
-| **Dynamic JavaScript Scraping** | Playwright headless Chromium renders SPAs (React, Next.js, Vue) correctly. `requests.get()` would return an empty shell. |
-| **domcontentloaded Trigger** | Avoids the `networkidle` trap on enterprise sites (Stripe, AWS) that maintain permanent WebSocket connections. |
-| **Network Interception** | Blocks images, CSS, and fonts at the browser level — cutting page scrape time from 10–15s to 1–3s. |
-| **MinHash + LSH Global Deduplication** | Detects "Thin Wrapper" plagiarism (≥90% similar content) in sub-linear O(1) time using Redis-backed Locality Sensitive Hashing. |
-| **Semantic Merkle Tree Delta Sync** | Re-embeds only changed chunks on cron updates, reducing embedding API cost by ~99% for small documentation updates. |
-| **Parent-Child Chunking** | 400-char child chunks for precise vector retrieval; 2000-char parent sections sent to the LLM for full context. |
-| **HNSW Vector Index** | Approximate nearest-neighbor search in sub-linear time — millisecond-scale queries across millions of embeddings. |
-| **Query Expansion + Re-Ranking** | LLM rewrites user questions with synonyms. Cohere Cross-Encoder re-ranks 30 vector candidates → top 5. |
-| **SSE Streaming** | LLM response streamed token-by-token via Server-Sent Events. Citations sent first, answer follows in real-time. |
-| **Redis Distributed Locking** | Doomsday Lock (`nx=True, ex=21600`) prevents concurrent duplicate scraping across all worker processes. |
-| **Sliding Window Rate Limiter** | Redis ZSET-based precise per-IP token bucket. Variable cost per request (bulk = cost × URL count). |
-| **Cron Worker with Lock Guard** | 30-day automatic re-sync with Redis lock check to prevent race conditions with manual user syncs. |
+| **Parent-Child Chunking with Headers** | Embeds small child chunks (400 chars) for precise vector retrieval, while retaining the parent section's context and markdown headers. We send the large parent block (2000 chars) to the LLM to prevent context loss. |
+| **Redis Doomsday Lock (Ticketing)** | Drops a temporary "ticket" (`nx=True`, 6-hour TTL) into Redis when a user requests a URL scrape. This prevents race conditions and duplicate processing across all workers. |
+| **RabbitMQ Asynchronous Processing** | Heavy HTML payloads (up to 5MB) are passed to RabbitMQ for durable, persistent message queuing, ensuring no data loss during the parsing and chunking phases. |
+| **Embeddings & Cross-Encoder Re-Ranking** | Uses Cohere to generate 1024-dim embeddings stored in PostgreSQL (`pgvector` HNSW index). We retrieve 30 candidates, then use a Cross-Encoder to re-rank and return the absolute top 5 chunks. |
+| **Sliding Window Rate Limiter** | A precise, per-IP token bucket implemented using Redis ZSETs to prevent API abuse and handle variable request costs. |
+
+---
+
+## Advanced Features
+
+| Feature | Description |
+|---|---|
+| **MinHash Global Deduplication** | Fast O(1) detection of plagiarized or deeply similar content using Redis-backed Locality Sensitive Hashing. |
+| **Semantic Merkle Tree Delta Sync** | Re-embeds only modified chunks during cron updates, saving significant embedding API costs. |
 
 ---
 
@@ -87,17 +89,27 @@ User (Browser / Extension)
 
 ## Key Design Decisions & Trade-offs
 
-### Why MinHash for global deduplication?
-Standard exact matching fails if a single word is changed. MinHash + LSH answers "is this similar to ANY existing document?" in O(1) time regardless of database size. We use Redis-backed `datasketch` MinHashLSH with 256 permutations (~6.25% error rate) at a 90% similarity threshold.
-
-### Why `domcontentloaded` and not `networkidle`?
-Enterprise sites (Stripe, Cloudflare-protected sites) maintain permanent WebSocket and telemetry connections. `networkidle` waits for all connections to close, which never happens — causing a 30-second timeout crash. `domcontentloaded` fires when the HTML and main JS are parsed, which is all we need for content extraction.
-
-### Why PostgreSQL and not Pinecone/Weaviate?
-Single database for both relational data and vectors eliminates sync complexity. PostgreSQL's HNSW index (via pgvector) achieves ~95%+ recall at sub-linear query time. We also need standard SQL for joins and filtering — features dedicated vector databases don't offer.
-
 ### Why Parent-Child chunking?
-Small chunks (400 chars) produce focused, precise vector embeddings. Large parent sections (2000 chars) provide full context to the LLM. Embedding large sections produces diluted vectors; sending small chunks to the LLM produces answers without context. Parent-Child gives us precision in retrieval and context in generation.
+Small chunks (400 chars) produce focused, precise vector embeddings. Large parent sections (2000 chars) provide full context to the LLM. Furthermore, we explicitly inject the markdown headers into the child chunks so the vector search understands the topic. Embedding large sections produces diluted vectors; sending small chunks to the LLM produces answers without context. Parent-Child gives us precision in retrieval and context in generation.
+
+### Why Redis and RabbitMQ together?
+Redis is exceptionally fast for lightweight coordination. We use it for the "Doomsday Lock" (preventing race conditions) and the Sliding Window Rate Limiter. However, Redis can struggle with massive payloads. When the scraper extracts 5MB of HTML, we drop that into RabbitMQ (`durable=True`). RabbitMQ is designed for large, persistent payloads and guarantees the parser won't lose the data if a worker crashes.
+
+### Why PostgreSQL (pgvector) over Pinecone?
+Using a single database for both relational data (URLs, timestamps) and vectors eliminates sync complexity. PostgreSQL's HNSW index achieves ~95%+ recall at sub-linear query time while allowing us to write standard SQL joins.
+
+### Why Re-Ranking?
+Standard cosine similarity searches often retrieve superficially similar chunks. By retrieving 30 initial candidates and passing them through a Cohere Cross-Encoder, the model actively scores the semantic relationship between the query and the chunk, pushing the most accurately contextual answers to the top 5.
+
+---
+
+## Experimental Optimizations (Bottom)
+
+### MinHash Global Deduplication
+Standard exact matching fails if a single word is changed. MinHash + LSH answers "is this similar to ANY existing document?" in O(1) time regardless of database size. We use Redis-backed `datasketch` MinHashLSH with 256 permutations.
+
+### Semantic Merkle Tree
+Instead of flushing the database on a cron update, we generate 256-bit hash signatures for every chunk. We compare the new Merkle Tree against the old one and only send the "dirty" chunks to the embedding API, saving substantial compute cost.
 
 ---
 
