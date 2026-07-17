@@ -9,9 +9,13 @@ const API_BASE =
 export default function SyncPage() {
   const navigate = useNavigate();
   const [url, setUrl] = useState('');
-  const [appState, setAppState] = useState('landing'); // 'landing', 'analyzing', 'sync'
+  const [appState, setAppState] = useState('landing'); // 'landing', 'analyzing', 'not_found', 'processing', 'indexed'
   const [error, setError] = useState('');
-  const [internalLinks, setInternalLinks] = useState([]);
+  
+  const [syncedLinks, setSyncedLinks] = useState([]);
+  const [unsyncedLinks, setUnsyncedLinks] = useState([]);
+  const [activeTab, setActiveTab] = useState('synced'); // 'synced' or 'unsynced'
+  
   const [selectedLinks, setSelectedLinks] = useState(new Set());
   const [loading, setLoading] = useState(false);
 
@@ -33,13 +37,15 @@ export default function SyncPage() {
       const data = await res.json();
 
       if (data.status === 'processing') {
-        setError("This URL is currently being fetched! Please wait 15 seconds and try again to see its internal links.");
-        setAppState('landing');
-      } else {
-        // Cached! Show the Sync UI
-        setInternalLinks(data.internal_links || []);
+        setAppState('processing');
+      } else if (data.status === 'not_found') {
+        setAppState('not_found');
+      } else if (data.status === 'indexed') {
+        setSyncedLinks(data.synced_links || []);
+        setUnsyncedLinks(data.unsynced_links || []);
         setSelectedLinks(new Set());
-        setAppState('sync');
+        setActiveTab('synced');
+        setAppState('indexed');
       }
     } catch (err) {
       setError("Analysis failed: " + err.message);
@@ -61,21 +67,26 @@ export default function SyncPage() {
     setSelectedLinks(newSet);
   };
 
-  async function handleSyncBulk() {
-    if (selectedLinks.size === 0) return;
+  async function handleSyncBulk(urlsToSync) {
+    if (!urlsToSync || urlsToSync.length === 0) return;
     
     setLoading(true);
     try {
       const res = await fetch(`${API_BASE}/sync_bulk`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls: Array.from(selectedLinks) })
+        body: JSON.stringify({ urls: urlsToSync })
       });
       
       if (!res.ok) throw new Error("Failed to queue links");
       
-      alert(`Successfully queued ${selectedLinks.size} pages for syncing! They will be available in chat shortly.`);
-      setSelectedLinks(new Set());
+      alert(`Successfully queued ${urlsToSync.length} pages for syncing! They will be available in chat shortly.`);
+      if (appState === 'indexed') {
+        setSelectedLinks(new Set());
+        // Move them optimistically to avoid confusion, or let user refresh
+      } else if (appState === 'not_found') {
+        setAppState('processing');
+      }
     } catch (err) {
       alert("Failed to sync: " + err.message);
     } finally {
@@ -119,59 +130,137 @@ export default function SyncPage() {
         <div className="step-card" style={{ maxWidth: '600px', margin: '40px auto', textAlign: 'center' }}>
           <div className="spinner" style={{ margin: '0 auto 20px', width: '40px', height: '40px', borderColor: 'rgba(139, 92, 246, 0.3)', borderTopColor: '#8b5cf6' }}></div>
           <h2 className="step-title">Checking Knowledge Base</h2>
-          <p className="step-description">Looking for existing data and fetching new links. Hang tight...</p>
+          <p className="step-description">Looking for existing data. Hang tight...</p>
         </div>
       )}
 
-      {appState === 'sync' && (
+      {appState === 'processing' && (
+        <div className="step-card" style={{ maxWidth: '600px', margin: '40px auto', textAlign: 'center' }}>
+          <div className="spinner" style={{ margin: '0 auto 20px', width: '40px', height: '40px', borderColor: 'rgba(59, 130, 246, 0.3)', borderTopColor: '#3b82f6' }}></div>
+          <h2 className="step-title">Indexing in Progress</h2>
+          <p className="step-description">The AI workers are currently processing this URL in the background. Please wait...</p>
+          <button onClick={() => handleAnalyze()} className="btn btn-secondary" style={{ marginTop: '20px' }}>
+            Refresh Status
+          </button>
+        </div>
+      )}
+
+      {appState === 'not_found' && (
+        <div className="step-card" style={{ maxWidth: '600px', margin: '40px auto', textAlign: 'center' }}>
+          <div style={{ fontSize: '48px', marginBottom: '20px' }}>🔍</div>
+          <h2 className="step-title">URL Not Found</h2>
+          <p className="step-description">This URL is not currently in the AI Knowledge Base.</p>
+          <button 
+            onClick={() => handleSyncBulk([url])} 
+            disabled={loading}
+            className="btn btn-primary"
+            style={{ width: '100%', marginTop: '20px', padding: '15px', fontSize: '1.1rem' }}
+          >
+            {loading ? 'Queuing...' : 'Scrape & Index This Page'}
+          </button>
+          <button onClick={() => setAppState('landing')} className="btn btn-secondary" style={{ marginTop: '10px' }}>
+            Go Back
+          </button>
+        </div>
+      )}
+
+      {appState === 'indexed' && (
         <div className="step-card" style={{ maxWidth: '800px', margin: '40px auto' }}>
           <div className="step-header" style={{ justifyContent: 'space-between', display: 'flex', alignItems: 'center' }}>
             <div>
               <div className="step-number">2</div>
-              <h2 className="step-title">Manage Knowledge Base</h2>
+              <h2 className="step-title">Knowledge Base Dashboard</h2>
             </div>
-            <button onClick={() => navigate(`/chat?url=${encodeURIComponent(url)}`)} className="btn btn-secondary">
-              Go to Chat
+            <button onClick={() => navigate(`/chat?url=${encodeURIComponent(url)}`)} className="btn btn-primary" style={{ padding: '12px 24px', fontSize: '1.1rem', background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)' }}>
+              💬 Start Chatting Now
             </button>
           </div>
           <p className="step-description">
-            We successfully loaded <strong>{url}</strong>. Here are the internal links we found. Select any additional pages you want to index into the AI's knowledge base.
+            We successfully found <strong>{url}</strong> in the database.
           </p>
           
-          <div style={{ maxHeight: '300px', overflowY: 'auto', margin: '20px 0', border: '1px solid var(--border-glass)', borderRadius: '8px', padding: '10px', background: 'var(--bg-tertiary)' }}>
-            {internalLinks.length === 0 ? (
-              <p style={{ color: 'var(--text-secondary)', textAlign: 'center' }}>No internal links found on this page.</p>
-            ) : (
-              internalLinks.map((link, idx) => (
-                <div key={idx} style={{ display: 'flex', alignItems: 'center', padding: '8px', borderBottom: '1px solid var(--border-glass)' }}>
-                  <input 
-                    type="checkbox" 
-                    id={`link-${idx}`} 
-                    checked={selectedLinks.has(link)}
-                    onChange={() => toggleLinkSelection(link)}
-                    disabled={selectedLinks.size >= 5 && !selectedLinks.has(link)}
-                    style={{ marginRight: '10px', cursor: (selectedLinks.size >= 5 && !selectedLinks.has(link)) ? 'not-allowed' : 'pointer' }}
-                  />
-                  <label htmlFor={`link-${idx}`} style={{ cursor: 'pointer', color: 'var(--text-primary)', wordBreak: 'break-all' }}>
-                    {link}
-                  </label>
-                </div>
-              ))
+          <div style={{ display: 'flex', gap: '10px', marginTop: '20px', borderBottom: '1px solid var(--border-glass)', paddingBottom: '10px' }}>
+            <button 
+              onClick={() => setActiveTab('synced')}
+              style={{
+                padding: '8px 16px',
+                background: activeTab === 'synced' ? 'var(--bg-secondary)' : 'transparent',
+                border: '1px solid',
+                borderColor: activeTab === 'synced' ? 'var(--border-glass)' : 'transparent',
+                borderRadius: '8px',
+                color: activeTab === 'synced' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                cursor: 'pointer'
+              }}
+            >
+              ✅ Synced Pages ({syncedLinks.length})
+            </button>
+            <button 
+              onClick={() => setActiveTab('unsynced')}
+              style={{
+                padding: '8px 16px',
+                background: activeTab === 'unsynced' ? 'var(--bg-secondary)' : 'transparent',
+                border: '1px solid',
+                borderColor: activeTab === 'unsynced' ? 'var(--border-glass)' : 'transparent',
+                borderRadius: '8px',
+                color: activeTab === 'unsynced' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                cursor: 'pointer'
+              }}
+            >
+              🔲 Available to Sync ({unsyncedLinks.length})
+            </button>
+          </div>
+
+          <div style={{ maxHeight: '300px', overflowY: 'auto', margin: '10px 0 20px', border: '1px solid var(--border-glass)', borderRadius: '8px', padding: '10px', background: 'var(--bg-tertiary)' }}>
+            {activeTab === 'synced' && (
+              syncedLinks.length === 0 ? (
+                <p style={{ color: 'var(--text-secondary)', textAlign: 'center' }}>No internal links have been synced yet.</p>
+              ) : (
+                syncedLinks.map((link, idx) => (
+                  <div key={idx} style={{ display: 'flex', alignItems: 'center', padding: '8px', borderBottom: '1px solid var(--border-glass)' }}>
+                    <span style={{ marginRight: '10px' }}>✅</span>
+                    <span style={{ color: 'var(--text-primary)', wordBreak: 'break-all' }}>{link}</span>
+                  </div>
+                ))
+              )
+            )}
+            
+            {activeTab === 'unsynced' && (
+              unsyncedLinks.length === 0 ? (
+                <p style={{ color: 'var(--text-secondary)', textAlign: 'center' }}>No new internal links available to sync.</p>
+              ) : (
+                unsyncedLinks.map((link, idx) => (
+                  <div key={idx} style={{ display: 'flex', alignItems: 'center', padding: '8px', borderBottom: '1px solid var(--border-glass)' }}>
+                    <input 
+                      type="checkbox" 
+                      id={`link-${idx}`} 
+                      checked={selectedLinks.has(link)}
+                      onChange={() => toggleLinkSelection(link)}
+                      disabled={selectedLinks.size >= 5 && !selectedLinks.has(link)}
+                      style={{ marginRight: '10px', cursor: (selectedLinks.size >= 5 && !selectedLinks.has(link)) ? 'not-allowed' : 'pointer' }}
+                    />
+                    <label htmlFor={`link-${idx}`} style={{ cursor: 'pointer', color: 'var(--text-primary)', wordBreak: 'break-all' }}>
+                      {link}
+                    </label>
+                  </div>
+                ))
+              )
             )}
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ color: 'var(--text-secondary)' }}>
-              {selectedLinks.size} / 5 links selected
-            </span>
-            <button 
-              onClick={handleSyncBulk} 
-              disabled={loading || selectedLinks.size === 0}
-              className="btn btn-primary"
-            >
-              {loading ? 'Queueing...' : 'Sync Selected Pages'}
-            </button>
-          </div>
+          {activeTab === 'unsynced' && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ color: 'var(--text-secondary)' }}>
+                {selectedLinks.size} / 5 links selected
+              </span>
+              <button 
+                onClick={() => handleSyncBulk(Array.from(selectedLinks))} 
+                disabled={loading || selectedLinks.size === 0}
+                className="btn btn-primary"
+              >
+                {loading ? 'Queueing...' : 'Sync Selected Pages'}
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>

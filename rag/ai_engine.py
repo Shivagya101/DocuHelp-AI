@@ -14,11 +14,7 @@ from utils.llm_provider import llm
 load_dotenv()
 
 # Initialize raw Cohere client for Re-Ranking
-cohere_client = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 cohere_async_client = cohere.AsyncClientV2(api_key=os.getenv("COHERE_API_KEY"))
-
-
-
 # Initialize Cohere cloud embedding model (1024-dimension vectors)
 print("Initializing Cohere embeddings model...")
 embedding_model = CohereEmbeddings(model="embed-english-v3.0")

@@ -5,12 +5,13 @@ from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 from utils.rabbitmq_provider import publish_to_queue
 from utils.redis_provider import get_redis_connection, enqueue_scrape_task
+from utils.url_utils import clean_url
 
 # FIX FOR WINDOWS: Playwright uses asyncio subprocesses which crash if SelectorEventLoop is used.
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-def fetch_and_publish(url: str, base_url: str = None, current_depth: int = 0, max_depth: int = 2, is_cron_update: bool = False):
+def fetch_and_publish(url: str, base_url: str = None, is_cron_update: bool = False):
     """
     RQ task to scrape a URL using Playwright, extract internal links for DLS, and publish HTML to RabbitMQ.
     """
@@ -21,7 +22,7 @@ def fetch_and_publish(url: str, base_url: str = None, current_depth: int = 0, ma
     visited_key = f"visited:{base_url}"
     active_key = f"active:{url}"
 
-    print(f"[Scraper] Starting scrape for URL: {url} (Depth {current_depth}/{max_depth})")
+    print(f"[Scraper] Starting scrape for URL: {url}")
     
     html_content = ""
     try:
@@ -41,8 +42,8 @@ def fetch_and_publish(url: str, base_url: str = None, current_depth: int = 0, ma
                     route.continue_()
             page.route("**/*", intercept_route)
 
-            # Wait until network is mostly idle to ensure JS is rendered
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            # Wait until DOM is loaded to ensure JS is rendered. Avoid networkidle on tracker-heavy sites like Stripe
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
             
             # 3. AUTO-SCROLLING: Force lazy-loaded content to render
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -65,30 +66,28 @@ def fetch_and_publish(url: str, base_url: str = None, current_depth: int = 0, ma
 
     # Extract internal links for user-driven sync checklist
     valid_links_to_process = []
-    if not is_cron_update:
-        try:
-            soup = BeautifulSoup(html_content, "html.parser")
-            parsed_base = urlparse(base_url)
-            base_domain = parsed_base.netloc
-            base_path = parsed_base.path if parsed_base.path else "/"
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        parsed_base = urlparse(base_url)
+        base_domain = parsed_base.netloc
+        base_path = parsed_base.path if parsed_base.path else "/"
+        
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            absolute_link = urljoin(url, href)
+            absolute_link = clean_url(absolute_link)
             
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                absolute_link = urljoin(url, href)
-                absolute_link = absolute_link.split("#")[0]
-                absolute_link = absolute_link.rstrip("/")
-                
-                parsed_link = urlparse(absolute_link)
-                link_domain = parsed_link.netloc
-                link_path = parsed_link.path
-                
-                if link_domain == base_domain and absolute_link.startswith("http"):
-                    if link_path.startswith(base_path):
-                        if absolute_link not in valid_links_to_process:
-                            valid_links_to_process.append(absolute_link)
-                            
-        except Exception as e:
-            print(f"[Scraper] Error extracting internal links: {e}")
+            parsed_link = urlparse(absolute_link)
+            link_domain = parsed_link.netloc
+            link_path = parsed_link.path
+            
+            if link_domain == base_domain and absolute_link.startswith("http"):
+                if link_path.startswith(base_path):
+                    if absolute_link not in valid_links_to_process:
+                        valid_links_to_process.append(absolute_link)
+                        
+    except Exception as e:
+        print(f"[Scraper] Error extracting internal links: {e}")
 
     # Publish to RabbitMQ
     try:

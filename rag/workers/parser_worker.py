@@ -4,6 +4,7 @@ import asyncio
 from database import AsyncSessionLocal
 import aio_pika
 from utils.rabbitmq_provider import consume_from_queue
+from utils.redis_provider import get_async_redis_connection
 
 async def process_message(message: aio_pika.abc.AbstractIncomingMessage):
     async with message.process(ignore_processed=True):
@@ -44,7 +45,7 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage):
                         get_chunks_for_scan_async, 
                         apply_delta_update_async, 
                         update_scan_content_async, 
-                        update_scan_timestamp_async
+                        update_scan_metadata_async
                     )
                     from merkle_sync import MerkleTree, diff_trees
                     
@@ -67,9 +68,23 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage):
                             to_delete, to_add, to_update_parents = diff_trees(old_tree, new_tree)
                             await apply_delta_update_async(db, scan_id, to_delete, to_add, to_update_parents)
                             print(f"[Parser] Successfully updated {url} via Merkle Diff.")
+                            
+                            # Prevent Signature Drift: Update MinHash LSH in Redis
+                            from utils.minhash_provider import generate_minhash, get_lsh
+                            print(f"[Parser] Updating MinHash LSH for {url} to prevent signature drift...")
+                            full_text = " ".join([c for c, _, _ in chunks])
+                            new_minhash = generate_minhash(full_text)
+                            
+                            lsh = get_lsh()
+                            try:
+                                lsh.remove(str(scan_id))
+                            except ValueError:
+                                pass # Safely ignore if not found
+                            lsh.insert(str(scan_id), new_minhash)
+                            print(f"[Parser] MinHash signature successfully synced in Redis.")
                         
-                        # Prevent infinite cron loops by resetting the timestamp!
-                        await update_scan_timestamp_async(db, scan_id)
+                        # Prevent infinite cron loops by resetting the timestamp, and save the newly extracted links!
+                        await update_scan_metadata_async(db, scan_id, internal_links=data.get("internal_links", []))
                     else:
                         result = await update_scan_content_async(
                             db, 
@@ -93,6 +108,15 @@ async def process_message(message: aio_pika.abc.AbstractIncomingMessage):
             print(f"[Parser] Critical Error during processing: {e}")
             # Nack the message so it goes back to the queue or dead-letter
             await message.nack(requeue=False)
+        finally:
+            # DOOMSDAY LOCK CLEANUP
+            if url:
+                try:
+                    redis_conn = get_async_redis_connection()
+                    await redis_conn.delete(f"active:{url}")
+                    print(f"[Parser] Released Doomsday Lock for {url}")
+                except Exception as e:
+                    print(f"[Parser] Failed to release Doomsday lock for {url}: {e}")
 
 async def main():
     print("[Parser] Starting Async RabbitMQ consumer...")

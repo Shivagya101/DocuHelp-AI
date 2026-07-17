@@ -1,145 +1,136 @@
-# 🛡️ DocuHelp (Documentation Engine)
+# DocuHelp AI — Intelligent Documentation Assistant
 
-### An Intelligent Software Documentation & API Reference Assistant
-
-DocuHelp is an intelligent middleware designed to ingest, monitor, deduplicate, and semantically query massive volumes of **software documentation**, **API references**, and **developer guides**. It tracks documentation changes over time using structural diffing and allows developers to chat with their ecosystem documentation via an advanced RAG (Retrieval-Augmented Generation) pipeline.
+> A production-grade, distributed RAG (Retrieval-Augmented Generation) engine that ingests any software documentation website and lets developers ask natural-language questions with citation-backed, streaming answers.
 
 ---
 
-## 🚀 Features
+## Features
 
 | Feature | Description |
-|---------|-------------|
-| **Smart Ingestion Pipeline** | Uses Playwright (Headless Browser) running in background RQ workers to dynamically crawl modern documentation sites (React, Vue, SPAs). |
-| **Two-Stage Deduplication** | Employs exact text-matching (`pg_trgm`) and semantic vector thresholding (`pgvector` distance < 0.10) to aggressively block duplicate context from polluting the vector space. |
-| **Merkle Tree Structural Diffing** | Compares the hierarchical heading structure (H1-H6) of incoming document updates against the existing database, calculating precise patch sets to insert, update, or delete chunks. |
-| **Hybrid Search (In Progress)** | Combines exact keyword matching (BM25) with semantic vector search, dynamically re-ranking results using Reciprocal Rank Fusion (RRF). |
-| **RAG Chatbot** | Ask questions about any ingested documentation in natural language powered by Groq and Cohere embeddings. |
+|---|---|
+| **Dynamic JavaScript Scraping** | Playwright headless Chromium renders SPAs (React, Next.js, Vue) correctly. `requests.get()` would return an empty shell. |
+| **domcontentloaded Trigger** | Avoids the `networkidle` trap on enterprise sites (Stripe, AWS) that maintain permanent WebSocket connections. |
+| **Network Interception** | Blocks images, CSS, and fonts at the browser level — cutting page scrape time from 10–15s to 1–3s. |
+| **MinHash + LSH Global Deduplication** | Detects "Thin Wrapper" plagiarism (≥90% similar content) in sub-linear O(1) time using Redis-backed Locality Sensitive Hashing. |
+| **Semantic Merkle Tree Delta Sync** | Re-embeds only changed chunks on cron updates, reducing embedding API cost by ~99% for small documentation updates. |
+| **Parent-Child Chunking** | 400-char child chunks for precise vector retrieval; 2000-char parent sections sent to the LLM for full context. |
+| **HNSW Vector Index** | Approximate nearest-neighbor search in sub-linear time — millisecond-scale queries across millions of embeddings. |
+| **Query Expansion + Re-Ranking** | LLM rewrites user questions with synonyms. Cohere Cross-Encoder re-ranks 30 vector candidates → top 5. |
+| **SSE Streaming** | LLM response streamed token-by-token via Server-Sent Events. Citations sent first, answer follows in real-time. |
+| **Redis Distributed Locking** | Doomsday Lock (`nx=True, ex=21600`) prevents concurrent duplicate scraping across all worker processes. |
+| **Sliding Window Rate Limiter** | Redis ZSET-based precise per-IP token bucket. Variable cost per request (bulk = cost × URL count). |
+| **Cron Worker with Lock Guard** | 30-day automatic re-sync with Redis lock check to prevent race conditions with manual user syncs. |
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-User (Dashboard / API)
-        ↓
-  Python RAG Engine (FastAPI)
+User (Browser / Extension)
         │
-        ├─▶ Cronjob Dispatcher (Detects stale documentation)
-        │       ↓ (Redis Queue)
-        ├─▶ Scraper Worker (Playwright / BeautifulSoup)
-        │       ↓ (RabbitMQ Queue)
-        └─▶ Parser Worker (Merkle Tree Diffing / Chunking)
-                ↓
-  ┌──────────────────────────────────────────────┐
-  │  PostgreSQL (pgvector, pg_trgm)              │
-  │  Two-Stage Deduplication Gate                │
-  │  Cohere Embeddings                           │
-  │  Groq (LLM Inference)                        │
-  └──────────────────────────────────────────────┘
+        ▼ HTTP POST /sync_bulk
+┌──────────────────────────────────────────────────────┐
+│           FastAPI Gateway (main.py)                  │
+│                                                      │
+│  /analyze  → Check Redis lock + DB → return status  │
+│  /sync_bulk → Set Doomsday Lock → Enqueue to RQ     │
+│  /chat     → Full RAG pipeline → Stream SSE         │
+│                                                      │
+│  Rate Limiter: Sliding Window Log (Redis ZSET)       │
+└──────────┬────────────────────────────┬──────────────┘
+           │ Enqueue job (URL ~50 bytes) │ Read from DB
+           ▼                            ▼
+    Redis RQ Queue             PostgreSQL + pgvector
+    "scrape_tasks"             ┌────────────────────┐
+    Doomsday Locks             │ processed_sites    │
+    Visited URL Sets           │   - url_hash (PK)  │
+    Rate Limit ZSETs           │   - internal_links │
+    MinHash LSH Index          │   - created_at     │
+           │                   │ policy_chunks      │
+           ▼                   │   - chunk_text     │
+   Scraper Worker              │   - parent_text    │
+   scraper_worker.py           │   - Vector(1024)   │
+   ┌─────────────────┐         └────────────────────┘
+   │ Playwright      │         Indexes: HNSW, GIN,
+   │ domcontentloaded│         B-tree text_pattern_ops
+   │ Block images/CSS│
+   │ Auto-scroll     │
+   │ 1s JS settle    │
+   │ Extract links   │
+   └────────┬────────┘
+            │ Publish HTML + links (500KB–5MB)
+            ▼
+     RabbitMQ Queue
+     "parse_tasks"
+     durable=True + PERSISTENT messages
+            │
+            ▼
+   Parser Worker (parser_worker.py + ai_engine.py)
+   ┌────────────────────────────────────────────┐
+   │ 1. clean_html() — BS4 + markdownify        │
+   │ 2. generate_chunks() — Header → Parent →   │
+   │    Child (400 chars, Language.MARKDOWN)     │
+   │ 3. MinHash Global Dedup Check (Redis LSH)  │
+   │ 4. Batch embed (Cohere) → pgvector insert  │
+   │    OR: Merkle diff → surgical delta update │
+   │ 5. Release Doomsday Lock (always, finally) │
+   └────────────────────────────────────────────┘
+            ▲
+   Dispatches every 30 days
+   Cron Worker (cron_worker.py)
+   - Queries DB for created_at < 30 days ago
+   - Checks Redis lock before enqueuing
+   - Sets is_cron_update=True flag
 ```
 
 ---
 
-## 📂 Project Structure
+## Key Design Decisions & Trade-offs
 
-```
-DocuHelp/
-├── frontend/               # React Dashboard (TBD)
-├── backend/                # Node.js API Gateway (Legacy)
-├── extension/              # Chrome Extension (Legacy)
-│
-├── rag/                    # Python RAG & Ingestion Engine
-│   ├── main.py             # FastAPI backend interface
-│   ├── database.py         # SQLAlchemy Setup (PostgreSQL)
-│   ├── ai_engine.py        # Embeddings (Cohere), Chunking (LangChain), LLM (Groq)
-│   ├── merkle_sync.py      # Merkle Tree structural diffing logic
-│   ├── run_workers.ps1     # Unified launcher for background workers
-│   │
-│   ├── repository/         # Database persistence layers
-│   │   └── scan_repository.py  # `pg_trgm` and `pgvector` Two-Stage logic
-│   │
-│   └── workers/            # Background Processors
-│       ├── cron_worker.py      # Dispatches stale documentation updates
-│       ├── start_worker.py     # RQ Worker (Playwright Scraper)
-│       └── parser_worker.py    # RabbitMQ Consumer (Merkle Diff Engine)
-│
-└── README.md
-```
+### Why MinHash for global deduplication?
+Standard exact matching fails if a single word is changed. MinHash + LSH answers "is this similar to ANY existing document?" in O(1) time regardless of database size. We use Redis-backed `datasketch` MinHashLSH with 256 permutations (~6.25% error rate) at a 90% similarity threshold.
+
+### Why `domcontentloaded` and not `networkidle`?
+Enterprise sites (Stripe, Cloudflare-protected sites) maintain permanent WebSocket and telemetry connections. `networkidle` waits for all connections to close, which never happens — causing a 30-second timeout crash. `domcontentloaded` fires when the HTML and main JS are parsed, which is all we need for content extraction.
+
+### Why PostgreSQL and not Pinecone/Weaviate?
+Single database for both relational data and vectors eliminates sync complexity. PostgreSQL's HNSW index (via pgvector) achieves ~95%+ recall at sub-linear query time. We also need standard SQL for joins and filtering — features dedicated vector databases don't offer.
+
+### Why Parent-Child chunking?
+Small chunks (400 chars) produce focused, precise vector embeddings. Large parent sections (2000 chars) provide full context to the LLM. Embedding large sections produces diluted vectors; sending small chunks to the LLM produces answers without context. Parent-Child gives us precision in retrieval and context in generation.
 
 ---
 
-## 🛠️ Setup & Execution
+## Project Structure
 
-### 1. Database & Brokers (Docker)
-Ensure you have the core infrastructure running via Docker:
-- **PostgreSQL** (with `pgvector` and `pg_trgm` enabled) on port `5432`
-- **Redis** on port `6379` (For RQ Task Queue)
-- **RabbitMQ** on port `5672` (For Parser Queue)
-
-### 2. Environment Variables
-Create a `.env` file in the `rag/` directory:
-```
-DATABASE_URL=postgresql://user:password@localhost:5432/docuhelp
-REDIS_URL=redis://localhost:6379/0
-RABBITMQ_URL=amqp://guest:guest@localhost:5672/
-COHERE_API_KEY=your_key
-GROQ_API_KEY=your_key
-```
-
-### 3. Running the RAG Engine & Workers
-Activate your virtual environment, then start the background pipeline:
-
-```bash
-cd rag
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-playwright install
-
-# Terminal 1: Start the Scraper Worker (RQ)
-python -m workers.start_worker
-
-# Terminal 2: Start the Parser Worker (RabbitMQ)
-python -u -m workers.parser_worker
-
-# Terminal 3: Fire the Cron Dispatcher (or run it on a schedule)
-python -m workers.cron_worker
-```
+Please refer to [FILE_STRUCTURE.md](FILE_STRUCTURE.md) for a detailed breakdown of the codebase and technical documentation files.
 
 ---
 
-## 🧠 Deep Dive: Ingestion Engine
+## Setup & Running
 
-1. **Detection** — The `cron_worker` scans the PostgreSQL `processed_sites` table for URLs that haven't been updated in X days. It pushes a task to Redis.
-2. **Dynamic Scraping** — The `start_worker` uses Playwright to fully render JavaScript-heavy documentation pages, extracts the HTML, and pushes a payload to RabbitMQ.
-3. **Chunking** — The `parser_worker` consumes the HTML. It cleans the text and uses a `MarkdownHeaderTextSplitter` combined with a `RecursiveCharacterTextSplitter` to create structural, overlapping chunks.
-4. **Merkle Diffing** — A hierarchical Merkle Tree is built from the new chunks and compared against the existing tree in the database, yielding precise `to_add` and `to_delete` batches.
-5. **Two-Stage Deduplication** — Before new chunks are blindly inserted, they pass through a strict Postgres gate:
-    - **Stage 1 (Text):** `pg_trgm` drops any chunk that shares 90% literal text similarity with an existing chunk.
-    - **Stage 2 (Vector):** Cohere embeds the surviving chunks. `pgvector` drops any chunk with a cosine distance `< 0.10` compared to existing chunks.
+Please refer to [SETUP.md](SETUP.md) for detailed instructions on configuring environment variables, starting the infrastructure, and running the background workers.
 
 ---
 
-## 🛠️ Tech Stack
+## Technology Stack
 
-| Layer | Technology |
-|-------|-----------|
-| **Core RAG Engine** | Python, FastAPI |
-| **Background Tasks** | Redis Queue (RQ), RabbitMQ |
-| **Dynamic Scraper** | Playwright, BeautifulSoup |
-| **Vector DB** | PostgreSQL (`pgvector`, `pg_trgm`) |
-| **Embeddings** | Cohere |
-| **AI / LLM** | Groq |
-| **Text Processing** | LangChain |
+| Layer | Technology | Key Reason |
+|---|---|---|
+| API Framework | FastAPI + asyncio | Native async, Pydantic validation, SSE streaming |
+| Web Scraping | Playwright Chromium | Executes JavaScript — required for SPAs |
+| Scrape Queue | Redis + RQ | Fast in-memory dispatch, built-in `Retry(max=3)` |
+| Parse Queue | RabbitMQ + aio_pika | Durable disk-backed transport for large HTML payloads |
+| Database | PostgreSQL + pgvector | Single DB for relational + vector; ACID guarantees |
+| Vector Index | HNSW (pgvector) | Sub-linear ANN search, ~95%+ recall |
+| Embeddings | Cohere embed-english-v3.0 | 1024-dim, strong retrieval, cheaper than OpenAI |
+| Re-Ranking | Cohere rerank-english-v3.0 | Cross-Encoder — understands negation, synonymy, context |
+| LLM Inference | Groq (Llama 3.3-70b) | 500+ tokens/sec — real-time SSE streaming feels instant |
+| Deduplication | MinHash + LSH (datasketch) | O(1) global similarity search via Redis |
+| Delta Sync | Semantic Merkle Tree (custom) | O(1) root check, surgical leaf-level diff |
+| Rate Limiting | Redis ZSET Sliding Window Log | Precise per-IP, per-endpoint, variable token cost |
+| ORM | SQLAlchemy (async) | Type-safe, async-compatible, migration-ready |
 
 ---
 
-## 👥 Team
-
-Built by the DocuHelp Team — **NIT Jamshedpur**
-- **Shivagya**  
-
-## 📄 License
-
-This project is developed for academic purposes at NIT Jamshedpur.
+Built at **NIT Jamshedpur** by Shivagya.

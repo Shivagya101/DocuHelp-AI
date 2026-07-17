@@ -26,7 +26,7 @@ print("Using PostgreSQL database from DATABASE_URL")
 import re
 ASYNC_DATABASE_URL = re.sub(r"^postgres(ql)?(\+[a-zA-Z0-9_-]+)?://", "postgresql+asyncpg://", DATABASE_URL)
 
-# 1. API Pool (High Performance, used by FastAPI)
+# 1. API Pool (used by FastAPI)
 async_engine = create_async_engine(ASYNC_DATABASE_URL, pool_recycle=3600)
 AsyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=async_engine, class_=AsyncSession)
 
@@ -63,23 +63,23 @@ async def get_async_db():
 
 # --- 4. INITIALIZATION ---
 async def init_db():
-    print("Initializing database tables with pgvector and pg_trgm extensions (Async)...")
+    print("Initializing database tables with pgvector extension (Async)...")
     async with async_engine.begin() as conn:
         # 1. WHAT IS VECTOR? 
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
         
-        # 2. WHAT IS PG_TRGM?
-        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS pg_trgm'))
-        
+
         # 3. WHERE ARE THE TABLES CREATED?
         # run_sync bridges the gap between async execution and SQLAlchemy's sync metadata builder
         await conn.run_sync(Base.metadata.create_all)
         
-        # 4. WHAT IS GIN?
-        await conn.execute(text('CREATE INDEX IF NOT EXISTS trgm_idx ON policy_chunks USING gin (parent_text gin_trgm_ops)'))
-        
+
         # 5. WHAT IS HNSW? (Hierarchical Navigable Small World)
         await conn.execute(text('CREATE INDEX IF NOT EXISTS chunk_embedding_idx ON policy_chunks USING hnsw (embedding vector_cosine_ops)'))
+        
+        # 6. WHAT IS TEXT_PATTERN_OPS?
+        # Optimizes prefix matching (LIKE 'https://site.com%') for isolated RAG context.
+        await conn.execute(text('CREATE INDEX IF NOT EXISTS idx_processed_site_url_prefix ON processed_sites (url text_pattern_ops)'))
         
     print("Database ready.")
 

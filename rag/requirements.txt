@@ -42,6 +42,11 @@ markdownify
 redis
 rq
 aio-pika
+datasketch[redis]
+hiredis
 
 # Advanced Scraping
 playwright
+
+# Normalization
+url-normalize

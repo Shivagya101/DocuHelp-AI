@@ -67,6 +67,38 @@ export default function ChatPage() {
     }
   }, [messages]);
 
+  // Handle copy button clicks for dynamically injected HTML
+  useEffect(() => {
+    const handleCopyClick = async (e) => {
+      if (e.target && e.target.classList.contains('copy-btn')) {
+        const preElement = e.target.nextElementSibling;
+        if (preElement && preElement.tagName === 'PRE') {
+          const codeToCopy = preElement.textContent;
+          try {
+            await navigator.clipboard.writeText(codeToCopy);
+            const originalText = e.target.textContent;
+            e.target.textContent = 'Copied!';
+            e.target.style.background = '#10b981'; // Success green
+            e.target.style.color = 'white';
+            
+            setTimeout(() => {
+              e.target.textContent = originalText;
+              e.target.style.background = '';
+              e.target.style.color = '';
+            }, 2000);
+          } catch (err) {
+            console.error('Failed to copy text: ', err);
+          }
+        }
+      }
+    };
+
+    document.addEventListener('click', handleCopyClick);
+    return () => {
+      document.removeEventListener('click', handleCopyClick);
+    };
+  }, []);
+
   // Connect to the KB when the component mounts if a URL is provided
   useEffect(() => {
     if (initialUrl) {
@@ -89,7 +121,7 @@ export default function ChatPage() {
       
       const data = await res.json();
       
-      if (data.status === 'cached') {
+      if (data.status === 'indexed') {
         setActiveUrl(targetUrl);
         setMessages([{
           role: 'bot',

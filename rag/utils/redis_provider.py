@@ -3,19 +3,22 @@ from redis import Redis
 import redis.asyncio as aioredis
 from rq import Queue, Retry
 
+# Initialize global connection pools (Best Practice)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_sync_pool = Redis.from_url(REDIS_URL)
+_async_pool = aioredis.Redis.from_url(REDIS_URL, decode_responses=True)
+
 def get_redis_connection():
     """
-    Initializes and returns a centralized Redis connection.
+    Returns the globally pooled synchronous Redis connection.
     """
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    return Redis.from_url(redis_url)
+    return _sync_pool
 
 def get_async_redis_connection():
     """
-    Initializes and returns an asynchronous Redis connection for FastAPI endpoints.
+    Returns the globally pooled asynchronous Redis connection.
     """
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    return aioredis.Redis.from_url(redis_url, decode_responses=True)
+    return _async_pool
 
 def get_scrape_queue():
     """
@@ -24,7 +27,7 @@ def get_scrape_queue():
     redis_conn = get_redis_connection()
     return Queue("scrape_tasks", connection=redis_conn)
 
-def enqueue_scrape_task(url: str, base_url: str = None, current_depth: int = 0, max_depth: int = 2, is_cron_update: bool = False):
+def enqueue_scrape_task(url: str, base_url: str = None, is_cron_update: bool = False):
     """
     Enqueues a scraping task into Redis.
     """
@@ -33,6 +36,6 @@ def enqueue_scrape_task(url: str, base_url: str = None, current_depth: int = 0, 
     queue = get_scrape_queue()
     queue.enqueue(
         "workers.scraper_worker.fetch_and_publish", 
-        url, base_url, current_depth, max_depth, is_cron_update,
+        url, base_url, is_cron_update,
         retry=Retry(max=3)
     )

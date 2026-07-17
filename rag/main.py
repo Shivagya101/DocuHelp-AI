@@ -1,18 +1,20 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 import json
+import hashlib
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 import database
-from database import get_async_db
+from database import get_async_db, ProcessedSite
 from repository import scan_repository
-from utils.redis_provider import enqueue_scrape_task
+from utils.redis_provider import enqueue_scrape_task, get_async_redis_connection
 import ai_engine
-from utils.rate_limiter import RateLimiter
+from utils.rate_limiter import check_rate_limit, extract_client_ip
+from utils.url_utils import clean_url
 
-from fastapi import FastAPI, HTTPException, Depends
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -41,7 +43,8 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     status: str
     message: str
-    internal_links: list[str] = []
+    synced_links: list[str] = []
+    unsynced_links: list[str] = []
 
 class ChatMessage(BaseModel):
     role: str
@@ -64,68 +67,78 @@ async def home():
     return {"message": "DocuHelper is running."}
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_policy(request: AnalyzeRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("analyze", max_requests=100, window_seconds=86400))):
+async def analyze_policy(request: AnalyzeRequest, raw_req: Request, db: AsyncSession = Depends(get_async_db)):
     """
-    1. Checks if we already have a scan for this URL in Database.
-    2. If YES: the user can chat, and we return the discovered internal_links for manual sync.
-    3. If NO: Drops a ticket into Redis and tells the user to refresh later.
+    1. Check Redis Lock. If locked -> return 'processing'
+    2. Check Database. If not found -> return 'not_found'
+    3. If found -> calculate synced/unsynced links and return 'indexed'
     """
-    # Normalize URL by removing trailing slashes
-    target_url = request.url.rstrip("/")
-
-    # 1. Check if it's already in Postgres
-    existing_scan = await scan_repository.get_scan_by_url_async(db, target_url)
-    if existing_scan and existing_scan.policy_text:
-        return AnalyzeResponse(
-            status="cached",
-            message="Already processed!",
-            internal_links=existing_scan.internal_links or []
-        )
-        
-    # 2. Use Redis Atomic Lock to prevent duplicate scraping
-    from utils.redis_provider import get_async_redis_connection
+    await check_rate_limit(extract_client_ip(raw_req), "analyze", cost=1, max_tokens=100)
+    
+    target_url = clean_url(request.url)
     redis_conn = get_async_redis_connection()
     active_key = f"active:{target_url}"
     
-    # Try to set an active lock. Returns True if successful, False if already exists.
-    is_fresh_request = await redis_conn.set(active_key, "1", nx=True, ex=1800)
-    
-    if not is_fresh_request:
+    # 1. Check if locked in Redis
+    is_locked = await redis_conn.exists(active_key)
+    if is_locked:
         return AnalyzeResponse(
             status="processing",
             message="Already in queue! Please wait."
         )
 
-    # 2. PROCESS NEW SCAN (Async via Redis)
-    print(f"Enqueueing scrape task for {target_url}")
-    # We no longer pass max_depth > 0, as we only scrape the single requested page.
-    enqueue_scrape_task(target_url, base_url=target_url, current_depth=0, max_depth=0)
+    # 2. Check if it's already in Postgres
+    existing_scan = await scan_repository.get_scan_by_url_async(db, target_url)
+    if not existing_scan or not existing_scan.policy_text:
+        return AnalyzeResponse(
+            status="not_found",
+            message="URL not found in database."
+        )
+        
+    # 3. Calculate synced vs unsynced links
+    all_links = existing_scan.internal_links or []
+    synced = []
+    unsynced = []
     
-    await redis_conn.close()
+    if all_links:
+        # Check which internal links exist in the database using url_hash for O(log n) lookup
+        hashed_links = [hashlib.md5(link.encode()).hexdigest() for link in all_links]
+        result = await db.execute(select(ProcessedSite.url).filter(ProcessedSite.url_hash.in_(hashed_links)))
+        synced_db_links = set(result.scalars().all())
+        
+        for link in all_links:
+            if link in synced_db_links:
+                synced.append(link)
+            else:
+                unsynced.append(link)
 
     return AnalyzeResponse(
-        status="processing",
-        message="Your link has been queued for scraping. Please check back soon."
+        status="indexed",
+        message="Already processed!",
+        synced_links=synced,
+        unsynced_links=unsynced
     )
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 class SyncBulkRequest(BaseModel):
     urls: list[str] = Field(..., max_length=5, description="Maximum of 5 URLs per bulk sync request")
 
 @app.post("/sync_bulk")
-async def sync_bulk_urls(request: SyncBulkRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("analyze", max_requests=100, window_seconds=86400))):
+async def sync_bulk_urls(request: SyncBulkRequest, raw_req: Request, db: AsyncSession = Depends(get_async_db)):
     """
     Endpoint for Manual User-Driven Sync. 
     Accepts a list of URLs and drops them into the queue.
-    Uses the same 'analyze' rate limit to prevent abuse.
+    Accurately deducts tokens based on the number of URLs requested.
     """
-    from utils.redis_provider import get_async_redis_connection
-    redis_conn = get_async_redis_connection()
+    url_count = len(request.urls)
+    await check_rate_limit(extract_client_ip(raw_req), "analyze", cost=url_count, max_tokens=100)
     
+    redis_conn = get_async_redis_connection()
     queued_count = 0
+    
     for url in request.urls:
-        target_url = url.rstrip("/")
+        target_url = clean_url(url)
         active_key = f"active:{target_url}"
         
         # Check cache
@@ -133,24 +146,23 @@ async def sync_bulk_urls(request: SyncBulkRequest, db: AsyncSession = Depends(ge
         if existing_scan and existing_scan.policy_text:
             continue
             
-        # Check active lock
-        if await redis_conn.set(active_key, "1", nx=True, ex=1800):
-            enqueue_scrape_task(target_url, base_url=target_url, current_depth=0, max_depth=0)
+        # Check active lock and enqueue (6 hour Doomsday TTL)
+        if await redis_conn.set(active_key, "1", nx=True, ex=21600):
+            enqueue_scrape_task(target_url, base_url=target_url)
             queued_count += 1
             
-    await redis_conn.close()
     return {"status": "success", "message": f"Successfully queued {queued_count} new pages for sync."}
 
 @app.post("/chat")
-async def chat_policy(request: ChatRequest, db: AsyncSession = Depends(get_async_db), _=Depends(RateLimiter("chat", max_requests=100, window_seconds=86400))):
+async def chat_policy(request: ChatRequest, raw_req: Request, db: AsyncSession = Depends(get_async_db)):
     """
     User asks a question about a specific URL.
     We load the context from Database and answer directly using Groq's context window.
     Server-Sent Events (SSE) to stream the response.
     """
-    # Normalize URL by removing trailing slashes
-    target_url = request.url.rstrip("/")
-
+    await check_rate_limit(extract_client_ip(raw_req), "chat", cost=1, max_tokens=100)
+    
+    target_url = clean_url(request.url)
     scan = await scan_repository.get_scan_by_url_async(db, target_url)
     
     if not scan or not scan.policy_text:
@@ -174,7 +186,7 @@ async def chat_policy(request: ChatRequest, db: AsyncSession = Depends(get_async
     query_embedding = ai_engine.embedding_model.embed_query(expanded_query)
     
     # 3. Query pgvector for a massive net of 30 chunks across the entire crawled domain
-    relevant_chunks = await scan_repository.get_relevant_chunks_async(db, request.url, query_embedding, limit=30)
+    relevant_chunks = await scan_repository.get_relevant_chunks_async(db, target_url, query_embedding, limit=30)
         
     if not relevant_chunks:
         raise HTTPException(status_code=500, detail="Error: No indexed chunks found for this policy. Please re-analyze the site.")

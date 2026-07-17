@@ -21,6 +21,6 @@ FastAPI-based documentation analysis service powering the DocuHelp platform.
 ## Environment Variables
 - `GROQ_API_KEY` — Your Groq API key for LLM inference
 - `COHERE_API_KEY` — Your Cohere API key for vector embeddings and reranking
-- `DATABASE_URL` — PostgreSQL connection string (must have pgvector and pg_trgm extensions)
+- `DATABASE_URL` — PostgreSQL connection string (must have pgvector extension)
 - `REDIS_URL` — Redis connection string for background task queues
 - `RABBITMQ_URL` — RabbitMQ connection string for chunking/parsing queues
