@@ -9,21 +9,11 @@
 | Feature | Description |
 |---|---|
 | **Parent-Child Chunking with Headers** | Embeds small child chunks (400 chars) for precise vector retrieval, while retaining the parent section's context and markdown headers. We send the large parent block (2000 chars) to the LLM to prevent context loss. |
-| **Redis Doomsday Lock (Ticketing)** | Drops a temporary "ticket" (`nx=True`, 6-hour TTL) into Redis when a user requests a URL scrape. This prevents race conditions and duplicate processing across all workers. |
+| **Redis Lock (Ticketing)** | Drops a temporary "ticket" into Redis when a user requests a URL scrape. This prevents race conditions and duplicate processing across all workers. |
 | **RabbitMQ Asynchronous Processing** | Heavy HTML payloads (up to 5MB) are passed to RabbitMQ for durable, persistent message queuing, ensuring no data loss during the parsing and chunking phases. |
-| **Embeddings & Cross-Encoder Re-Ranking** | Uses Cohere to generate 1024-dim embeddings stored in PostgreSQL (`pgvector` HNSW index). We retrieve 30 candidates, then use a Cross-Encoder to re-rank and return the absolute top 5 chunks. |
-| **Sliding Window Rate Limiter** | A precise, per-IP token bucket implemented using Redis ZSETs to prevent API abuse and handle variable request costs. |
+| **Embeddings & Cross-Encoder Re-Ranking** | Uses Cohere to generate 1024-dim embeddings stored in PostgreSQL. We retrieve 30 candidates, then use a Cross-Encoder to re-rank and return the absolute top 5 chunks. |
+| **Sliding Window Rate Limiter** | A precise, per-IP rate limiter implemented using Redis to prevent API abuse and handle variable request costs. |
 
----
-
-## Advanced Features
-
-| Feature | Description |
-|---|---|
-| **MinHash Global Deduplication** | Fast O(1) detection of plagiarized or deeply similar content using Redis-backed Locality Sensitive Hashing. |
-| **Semantic Merkle Tree Delta Sync** | Re-embeds only modified chunks during cron updates, saving significant embedding API costs. |
-
----
 
 ## Architecture
 
@@ -38,23 +28,23 @@ User (Browser / Extension)
 │  /sync_bulk → Set Doomsday Lock → Enqueue to RQ     │
 │  /chat     → Full RAG pipeline → Stream SSE         │
 │                                                      │
-│  Rate Limiter: Sliding Window Log (Redis ZSET)       │
+│  Rate Limiter: Sliding Window Log (Redis)            │
 └──────────┬────────────────────────────┬──────────────┘
-           │ Enqueue job (URL ~50 bytes) │ Read from DB
+           │ Enqueue job (URL)          │ Read from DB
            ▼                            ▼
     Redis RQ Queue             PostgreSQL + pgvector
     "scrape_tasks"             ┌────────────────────┐
     Doomsday Locks             │ processed_sites    │
     Visited URL Sets           │   - url_hash (PK)  │
-    Rate Limit ZSETs           │   - internal_links │
-    MinHash LSH Index          │   - created_at     │
+    Rate Limit Logs            │   - internal_links │
+    MinHash Index              │   - created_at     │
            │                   │ policy_chunks      │
            ▼                   │   - chunk_text     │
    Scraper Worker              │   - parent_text    │
-   scraper_worker.py           │   - Vector(1024)   │
+   scraper_worker.py           │   - Embeddings     │
    ┌─────────────────┐         └────────────────────┘
-   │ Playwright      │         Indexes: HNSW, GIN,
-   │ domcontentloaded│         B-tree text_pattern_ops
+   │ Playwright      │         Indexes: Vector Index,
+   │ domcontentloaded│         Text Index
    │ Block images/CSS│
    │ Auto-scroll     │
    │ 1s JS settle    │
@@ -95,21 +85,22 @@ Small chunks (400 chars) produce focused, precise vector embeddings. Large paren
 ### Why Redis and RabbitMQ together?
 Redis is exceptionally fast for lightweight coordination. We use it for the "Doomsday Lock" (preventing race conditions) and the Sliding Window Rate Limiter. However, Redis can struggle with massive payloads. When the scraper extracts 5MB of HTML, we drop that into RabbitMQ (`durable=True`). RabbitMQ is designed for large, persistent payloads and guarantees the parser won't lose the data if a worker crashes.
 
-### Why PostgreSQL (pgvector) over Pinecone?
-Using a single database for both relational data (URLs, timestamps) and vectors eliminates sync complexity. PostgreSQL's HNSW index achieves ~95%+ recall at sub-linear query time while allowing us to write standard SQL joins.
+### Why PostgreSQL over Vector Databases?
+Using a single database for both relational data (URLs, timestamps) and vectors eliminates sync complexity. PostgreSQL's Vector index provides highly accurate search results while being extremely fast, and allows us to write standard SQL joins.
 
 ### Why Re-Ranking?
 Standard cosine similarity searches often retrieve superficially similar chunks. By retrieving 30 initial candidates and passing them through a Cohere Cross-Encoder, the model actively scores the semantic relationship between the query and the chunk, pushing the most accurately contextual answers to the top 5.
 
 ---
 
-## Experimental Optimizations (Bottom)
+---
 
-### MinHash Global Deduplication
-Standard exact matching fails if a single word is changed. MinHash + LSH answers "is this similar to ANY existing document?" in O(1) time regardless of database size. We use Redis-backed `datasketch` MinHashLSH with 256 permutations.
+## Other Features
 
-### Semantic Merkle Tree
-Instead of flushing the database on a cron update, we generate 256-bit hash signatures for every chunk. We compare the new Merkle Tree against the old one and only send the "dirty" chunks to the embedding API, saving substantial compute cost.
+| Feature | Description |
+|---|---|
+| **MinHash Global Deduplication** | Fast detection of plagiarized or deeply similar content using Redis. |
+| **Semantic Merkle Tree Delta Sync** | Re-embeds only modified chunks during cron updates, saving significant API costs. |
 
 ---
 
@@ -134,15 +125,15 @@ Please refer to [SETUP.md](SETUP.md) for detailed instructions on configuring en
 | Scrape Queue | Redis + RQ | Fast in-memory dispatch, built-in `Retry(max=3)` |
 | Parse Queue | RabbitMQ + aio_pika | Durable disk-backed transport for large HTML payloads |
 | Database | PostgreSQL + pgvector | Single DB for relational + vector; ACID guarantees |
-| Vector Index | HNSW (pgvector) | Sub-linear ANN search, ~95%+ recall |
-| Embeddings | Cohere embed-english-v3.0 | 1024-dim, strong retrieval, cheaper than OpenAI |
-| Re-Ranking | Cohere rerank-english-v3.0 | Cross-Encoder — understands negation, synonymy, context |
-| LLM Inference | Groq (Llama 3.3-70b) | 500+ tokens/sec — real-time SSE streaming feels instant |
-| Deduplication | MinHash + LSH (datasketch) | O(1) global similarity search via Redis |
-| Delta Sync | Semantic Merkle Tree (custom) | O(1) root check, surgical leaf-level diff |
-| Rate Limiting | Redis ZSET Sliding Window Log | Precise per-IP, per-endpoint, variable token cost |
+| Vector Index | pgvector | Fast and accurate similarity search |
+| Embeddings | Cohere embed-english-v3.0 | 1024-dim, strong retrieval |
+| Re-Ranking | Cohere rerank-english-v3.0 | Cross-Encoder — understands context |
+| LLM Inference | Groq (Llama 3.3-70b) | 500+ tokens/sec — real-time streaming |
+| Deduplication | MinHash | Fast similarity detection |
+| Delta Sync | Merkle Tree | Efficiently updates only changed content |
+| Rate Limiting | Redis Sliding Window | Precise per-IP tracking |
 | ORM | SQLAlchemy (async) | Type-safe, async-compatible, migration-ready |
 
 ---
 
-Built at **NIT Jamshedpur** by Shivagya.
+Built by Shivagya.
