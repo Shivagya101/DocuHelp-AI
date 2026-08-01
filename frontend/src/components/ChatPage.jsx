@@ -4,7 +4,7 @@ import { useSearchParams } from 'react-router-dom';
 const API_BASE =
   window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
     ? "http://localhost:8000"
-    : "https://mehtaprince-rag.hf.space";
+    : import.meta.env.VITE_API_URL;
 
 function escapeHtml(text) {
   if (!text) return '';
